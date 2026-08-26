@@ -1,17 +1,16 @@
-﻿{
+{
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "1.0",
+	"Version": 2,
+	"VersionName": "1.1",
 	"FriendlyName": "SimpleGroomExporter",
 	"Description": "A simple groom exporter to Alembic",
 	"Category": "Geometry",
 	"CreatedBy": "Jacob Kostenick",
 	"CreatedByURL": "https://www.linkedin.com/in/jacob-kostenick",
-	"DocsURL": "https://github.com/kostenickj/UE5_SimpleGroomExporter",
+	"DocsURL": "https://github.com/PinkPanter/UE5_SimpleGroomExporter",
 	"MarketplaceURL": "",
+	"SupportURL": "",
 	"CanContainContent": false,
-	"IsBetaVersion": false,
-	"IsExperimentalVersion": false,
 	"Installed": false,
 	"Modules": [
 		{
