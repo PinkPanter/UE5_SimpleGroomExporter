@@ -1,4 +1,4 @@
-﻿// SimpleGroomExporter.cpp
+// SimpleGroomExporter.cpp
 
 #include "SimpleGroomExporter.h"
 #include "SimpleGroomExporterDialog.h"
@@ -33,6 +33,52 @@ using namespace Alembic::AbcGeom;
 DEFINE_LOG_CATEGORY_STATIC(LogSimpleGroomExporter, Log, All);
 
 #define LOCTEXT_NAMESPACE "SimpleGroomExporter"
+
+// Extract one UE position component for the chosen output axis (optionally negated).
+static float ResolveAxisComponent(const FVector3f& P, EGroomExportAxis Axis)
+{
+	switch (Axis)
+	{
+		case EGroomExportAxis::X:    return  P.X;
+		case EGroomExportAxis::NegX: return -P.X;
+		case EGroomExportAxis::Y:    return  P.Y;
+		case EGroomExportAxis::NegY: return -P.Y;
+		case EGroomExportAxis::Z:    return  P.Z;
+		case EGroomExportAxis::NegZ: return -P.Z;
+		default:                     return  0.0f;
+	}
+}
+
+// Expand a preset into three concrete axis mappings (Custom reads them straight from the options).
+static void ResolveAxisMapping(const USimpleGroomExportOptions* Options,
+	EGroomExportAxis& OutX, EGroomExportAxis& OutY, EGroomExportAxis& OutZ)
+{
+	switch (Options->AxisPreset)
+	{
+		case EGroomExportAxisPreset::Custom:
+			OutX = Options->CustomOutX; OutY = Options->CustomOutY; OutZ = Options->CustomOutZ; break;
+		case EGroomExportAxisPreset::ForUnity: // mapping for the Unity pipeline: Alembic(X, Y, Z) = UE(X, Z, Y)
+			OutX = EGroomExportAxis::X; OutY = EGroomExportAxis::Z; OutZ = EGroomExportAxis::Y; break;
+		case EGroomExportAxisPreset::Default: // raw UE coordinates
+		default:
+			OutX = EGroomExportAxis::X; OutY = EGroomExportAxis::Y; OutZ = EGroomExportAxis::Z; break;
+	}
+}
+
+// Human-readable axis label for logging.
+static const TCHAR* AxisName(EGroomExportAxis Axis)
+{
+	switch (Axis)
+	{
+		case EGroomExportAxis::X:    return TEXT("X");
+		case EGroomExportAxis::NegX: return TEXT("-X");
+		case EGroomExportAxis::Y:    return TEXT("Y");
+		case EGroomExportAxis::NegY: return TEXT("-Y");
+		case EGroomExportAxis::Z:    return TEXT("Z");
+		case EGroomExportAxis::NegZ: return TEXT("-Z");
+		default:                     return TEXT("?");
+	}
+}
 
 USimpleGroomExporter::USimpleGroomExporter()
 {
@@ -93,8 +139,17 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 			return false;
 		}
 
-		// Use the option selected by the user from the modal dialog
-		const bool bUseRenderdataForExport = ExportOptions.Options->bUseRenderData;
+		// Use the options selected by the user from the modal dialog
+		const USimpleGroomExportOptions* Options = ExportOptions.Options;
+		const bool bUseRenderdataForExport = Options->bUseRenderData;
+
+		// Resolve the coordinate mapping (preset -> three axes) once for the whole export.
+		EGroomExportAxis MapOutX, MapOutY, MapOutZ;
+		ResolveAxisMapping(Options, MapOutX, MapOutY, MapOutZ);
+		UE_LOG(LogSimpleGroomExporter, Log, TEXT("Axis mapping: Alembic(X,Y,Z) = UE(%s, %s, %s). ExportWidths=%s, ExportRootUV=%s"),
+			AxisName(MapOutX), AxisName(MapOutY), AxisName(MapOutZ),
+			Options->bExportWidths ? TEXT("YES") : TEXT("NO"),
+			Options->bExportRootUV ? TEXT("YES") : TEXT("NO"));
 
 		// TODO, consider using raw data hair desc data to export
 		// see how GenerateHairCardGenGroomData access it....
@@ -120,13 +175,47 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 			std::vector<Imath::V3f> AllPositions;
 			std::vector<int32_t> VerticesPerStrand;
 
+			// Standard Alembic attributes
+			// AllWidths - per-vertex strand diameter (geoScope = vertex), parallel to AllPositions.
+			// RootUVs   - per-strand root UV (geoScope = uniform), one entry per EMITTED strand.
+			std::vector<float> AllWidths;
+			std::vector<Imath::V2f> RootUVs;
+
 			AllPositions.reserve(Positions.Num());
 			VerticesPerStrand.reserve(StrandCurves.CurvesCount.Num());
+			AllWidths.reserve(Positions.Num());
+			RootUVs.reserve(StrandCurves.CurvesCount.Num());
 
 
 			const TArray<uint16>& CurvesCounts = StrandCurves.CurvesCount;
 			const TArray<uint32>& CurvesOffsets = StrandCurves.CurvesOffset;
 			const int32 NumStrands = CurvesCounts.Num();
+
+			// Sources for the new attributes (may be empty -> attribute is skipped instead of crashing).
+			const TArray<float>& PointsRadius = StrandPoints.PointsRadius;   // [0..1], parallel to PointsPosition
+			const TArray<FVector2f>& CurvesRootUV = StrandCurves.CurvesRootUV; // one entry per strand
+
+			// Write width only if the option is enabled AND there is a radius for every vertex we read (parallel to positions).
+			bool bWriteWidths = false;
+			if (Options->bExportWidths)
+			{
+				bWriteWidths = (PointsRadius.Num() == Positions.Num()) && (PointsRadius.Num() > 0);
+				if (!bWriteWidths)
+				{
+					UE_LOG(LogSimpleGroomExporter, Warning, TEXT("Group %d: PointsRadius size (%d) != PointsPosition size (%d). Exporting WITHOUT 'width' attribute."), GroupIdx, PointsRadius.Num(), Positions.Num());
+				}
+			}
+			// Write uv only if the option is enabled AND there is exactly one root UV per strand.
+			bool bWriteUVs = false;
+			if (Options->bExportRootUV)
+			{
+				bWriteUVs = (CurvesRootUV.Num() == NumStrands) && (NumStrands > 0);
+				if (!bWriteUVs)
+				{
+					UE_LOG(LogSimpleGroomExporter, Warning, TEXT("Group %d: CurvesRootUV size (%d) != strand count (%d). Exporting WITHOUT 'uv' attribute."), GroupIdx, CurvesRootUV.Num(), NumStrands);
+				}
+			}
+
 			int32 GroupVertexIndex = 0;
 			for (int32 StrandIndex = 0; StrandIndex < NumStrands; ++StrandIndex)
 			{
@@ -153,11 +242,43 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 						return false;
 					}
 					const FVector3f& Pos = Positions[CurrentVertexIndex];
-					AllPositions.emplace_back(Pos.X, Pos.Y, Pos.Z);
+					// UE -> Alembic axis mapping per the selected preset/custom (see ResolveAxisMapping).
+					AllPositions.emplace_back(
+						ResolveAxisComponent(Pos, MapOutX),
+						ResolveAxisComponent(Pos, MapOutY),
+						ResolveAxisComponent(Pos, MapOutZ));
+
+					// width is a scalar (radius), no coordinate transform. Same CurrentVertexIndex as positions keeps the arrays parallel.
+					if (bWriteWidths)
+					{
+						AllWidths.emplace_back(PointsRadius[CurrentVertexIndex]);
+					}
+
 					GroupVertexIndex++;
 				}
 
 				VerticesPerStrand.emplace_back(NumVertsInStrand);
+
+				// One root UV per EMITTED strand
+				if (bWriteUVs)
+				{
+					const FVector2f& RootUV = CurvesRootUV[StrandIndex];
+					RootUVs.emplace_back(RootUV.X, RootUV.Y);
+				}
+			}
+
+			// width -> geoScope = kVertexScope  (one diameter per vertex, parallel to positions).
+			OFloatGeomParam::Sample widthSample;
+			if (bWriteWidths)
+			{
+				widthSample = OFloatGeomParam::Sample(Alembic::Abc::FloatArraySample(AllWidths.data(), AllWidths.size()), kVertexScope);
+			}
+
+			// uv    -> geoScope = kUniformScope (2 floats per strand, one root UV per strand).
+			OV2fGeomParam::Sample uvSample;
+			if (bWriteUVs)
+			{
+				uvSample = OV2fGeomParam::Sample(V2fArraySample(RootUVs.data(), RootUVs.size()), kUniformScope);
 			}
 
 			// Create Alembic curve sample
@@ -166,6 +287,9 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 				V3fArraySample(AllPositions.data(), AllPositions.size())
 				, Int32ArraySample(VerticesPerStrand.data(), VerticesPerStrand.size())
 				, kCubic // Type of curve; can be adjusted as needed
+				, kNonPeriodic
+				, widthSample
+				, uvSample
 			);
 
 			// Define the name for the Alembic curves object
@@ -176,7 +300,14 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 			OCurvesSchema& CurvesSchema = CurvesObj.getSchema();
 			CurvesSchema.set(CurveSample);
 
-			UE_LOG(LogSimpleGroomExporter, Log, TEXT("Exported hair group: %s"), *HairGroupInfo.Info.GroupName.ToString());
+			// Per-group export report: geometry counts and which attributes were written.
+			UE_LOG(LogSimpleGroomExporter, Log, TEXT("Exported hair group %d '%s': %llu strands, %llu verts, width=%s, uv=%s"),
+				GroupIdx,
+				*HairGroupInfo.Info.GroupName.ToString(),
+				static_cast<uint64>(VerticesPerStrand.size()),
+				static_cast<uint64>(AllPositions.size()),
+				bWriteWidths ? TEXT("YES") : TEXT("NO"),
+				bWriteUVs ? TEXT("YES") : TEXT("NO"));
 			GroupIdx++;
 		}
 

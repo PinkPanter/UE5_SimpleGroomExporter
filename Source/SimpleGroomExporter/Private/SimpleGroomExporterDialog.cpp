@@ -27,6 +27,8 @@ void SSimpleGroomExporterExportDialog::Construct(const FArguments& InArgs)
 	DetailsViewArgs.bAllowMultipleTopLevelObjects = true;
 	SettingsPanel = PropertyEditorModule.CreateDetailView(DetailsViewArgs);
 	Config = NewObject<USimpleGroomExportOptions>();
+	// Restore the last-used options from the per-user editor config (config-tagged UPROPERTYs).
+	Config->LoadConfig();
 	SettingsPanel->SetObject(Config);
 
 	SWindow::Construct
@@ -108,6 +110,11 @@ FReply SSimpleGroomExporterExportDialog::OnButtonClick(EAppReturnType::Type Butt
 {
 	Result.RetType = ButtonID;
 	Result.Options = Config;
+	// Persist the chosen options so the next export reopens with the same settings.
+	if (ButtonID == EAppReturnType::Continue && Config)
+	{
+		Config->SaveConfig();
+	}
 	RequestDestroyWindow();
 	return FReply::Handled();
 }
