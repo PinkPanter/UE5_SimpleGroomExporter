@@ -5,6 +5,7 @@
 
 #include "HAL/Platform.h"
 #include "GroomAsset.h"
+#include "GroomAssetRendering.h"
 #include "Logging/LogMacros.h"
 #include "Misc/Paths.h"
 #include "Misc/FeedbackContext.h"
@@ -78,6 +79,16 @@ static const TCHAR* AxisName(EGroomExportAxis Axis)
 		case EGroomExportAxis::NegZ: return TEXT("-Z");
 		default:                     return TEXT("?");
 	}
+}
+
+// Normalized position along the strand, falling back to the vertex index.
+static float ResolveCoordU(const TArray<float>& PointsCoordU, uint32 PointIndex, uint32 VertexIndexInStrand, uint32 NumVertsInStrand)
+{
+	if (PointsCoordU.IsValidIndex(static_cast<int32>(PointIndex)))
+	{
+		return PointsCoordU[PointIndex];
+	}
+	return NumVertsInStrand > 1 ? VertexIndexInStrand / static_cast<float>(NumVertsInStrand - 1) : 0.0f;
 }
 
 USimpleGroomExporter::USimpleGroomExporter()
@@ -175,16 +186,15 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 			std::vector<Imath::V3f> AllPositions;
 			std::vector<int32_t> VerticesPerStrand;
 
-			// Standard Alembic attributes
-			// AllWidths - per-vertex strand diameter (geoScope = vertex), parallel to AllPositions.
-			// RootUVs   - per-strand root UV (geoScope = uniform), one entry per EMITTED strand.
+			// Both at geoScope = vertex, parallel to AllPositions: diameters in centimeters, and
+			// each strand's root UV repeated across its vertices.
 			std::vector<float> AllWidths;
 			std::vector<Imath::V2f> RootUVs;
 
 			AllPositions.reserve(Positions.Num());
 			VerticesPerStrand.reserve(StrandCurves.CurvesCount.Num());
 			AllWidths.reserve(Positions.Num());
-			RootUVs.reserve(StrandCurves.CurvesCount.Num());
+			RootUVs.reserve(Positions.Num());
 
 
 			const TArray<uint16>& CurvesCounts = StrandCurves.CurvesCount;
@@ -192,8 +202,26 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 			const int32 NumStrands = CurvesCounts.Num();
 
 			// Sources for the new attributes (may be empty -> attribute is skipped instead of crashing).
-			const TArray<float>& PointsRadius = StrandPoints.PointsRadius;   // [0..1], parallel to PointsPosition
+			// PointsRadius is a world radius in centimeters, despite what its declaration says: the
+			// normalized form the declaration describes only exists in the packed render data.
+			const TArray<float>& PointsRadius = StrandPoints.PointsRadius;   // centimeters, parallel to PointsPosition
+			const TArray<float>& PointsCoordU = StrandPoints.PointsCoordU;   // [0..1], parallel to PointsPosition
 			const TArray<FVector2f>& CurvesRootUV = StrandCurves.CurvesRootUV; // one entry per strand
+
+			// The rendered radius is PointsRadius * lerp(HairRootScale, HairTipScale, CoordU), and
+			// a Hair Width override rescales the group on top of that.
+			FHairGeometrySettings Geometry;
+			const TArray<FHairGroupsRendering>& GroupsRendering = Groom->GetHairGroupsRendering();
+			if (GroupsRendering.IsValidIndex(GroupIdx))
+			{
+				Geometry = GroupsRendering[GroupIdx].GeometrySettings;
+			}
+			else
+			{
+				UE_LOG(LogSimpleGroomExporter, Warning, TEXT("Group %d: no rendering settings on the groom asset. Exporting widths with the defaults HairRootScale=%.4f, HairTipScale=%.4f and no width override."),
+					GroupIdx, Geometry.HairRootScale, Geometry.HairTipScale);
+				Geometry.HairWidth_Override = false;
+			}
 
 			// Write width only if the option is enabled AND there is a radius for every vertex we read (parallel to positions).
 			bool bWriteWidths = false;
@@ -205,6 +233,27 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 					UE_LOG(LogSimpleGroomExporter, Warning, TEXT("Group %d: PointsRadius size (%d) != PointsPosition size (%d). Exporting WITHOUT 'width' attribute."), GroupIdx, PointsRadius.Num(), Positions.Num());
 				}
 			}
+
+			// The override, resolved into one factor: it makes the widest strand match Hair Width.
+			float RadiusScale = 1.0f;
+			if (bWriteWidths && Geometry.HairWidth_Override)
+			{
+				float MaxRadius = 0.0f;
+				for (float Radius : PointsRadius)
+				{
+					MaxRadius = FMath::Max(MaxRadius, Radius);
+				}
+
+				if (MaxRadius > 0.0f)
+				{
+					RadiusScale = (Geometry.HairWidth * 0.5f) / MaxRadius;
+				}
+				else
+				{
+					UE_LOG(LogSimpleGroomExporter, Warning, TEXT("Group %d: every PointsRadius is zero, so the Hair Width override cannot be applied."), GroupIdx);
+				}
+			}
+
 			// Write uv only if the option is enabled AND there is exactly one root UV per strand.
 			bool bWriteUVs = false;
 			if (Options->bExportRootUV)
@@ -233,6 +282,8 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 				// Collect positions for the current strand, curve offsets only seem to be set when using RENDER data, not hair strands raw datas
 				uint32 StartVertexIndex = CurvesOffsets[StrandIndex];
 
+				const FVector2f RootUV = bWriteUVs ? CurvesRootUV[StrandIndex] : FVector2f::ZeroVector;
+
 				for (uint32 VertexIndexInStrand = 0; VertexIndexInStrand < NumVertsInStrand; ++VertexIndexInStrand)
 				{
 					uint32 CurrentVertexIndex = bUseRenderdataForExport ? StartVertexIndex + VertexIndexInStrand : GroupVertexIndex;
@@ -248,37 +299,39 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 						ResolveAxisComponent(Pos, MapOutY),
 						ResolveAxisComponent(Pos, MapOutZ));
 
-					// width is a scalar (radius), no coordinate transform. Same CurrentVertexIndex as positions keeps the arrays parallel.
+					// width is a scalar, no coordinate transform. Same CurrentVertexIndex as positions keeps the arrays parallel.
 					if (bWriteWidths)
 					{
-						AllWidths.emplace_back(PointsRadius[CurrentVertexIndex]);
+						const float CoordU = ResolveCoordU(PointsCoordU, CurrentVertexIndex, VertexIndexInStrand, NumVertsInStrand);
+						const float Taper = FMath::Lerp(Geometry.HairRootScale, Geometry.HairTipScale, CoordU);
+						// Alembic 'width' is a diameter, PointsRadius is a radius.
+						AllWidths.emplace_back(2.0f * PointsRadius[CurrentVertexIndex] * RadiusScale * Taper);
+					}
+
+					// Vertex scope keeps the uv array parallel to positions.
+					if (bWriteUVs)
+					{
+						RootUVs.emplace_back(RootUV.X, RootUV.Y);
 					}
 
 					GroupVertexIndex++;
 				}
 
 				VerticesPerStrand.emplace_back(NumVertsInStrand);
-
-				// One root UV per EMITTED strand
-				if (bWriteUVs)
-				{
-					const FVector2f& RootUV = CurvesRootUV[StrandIndex];
-					RootUVs.emplace_back(RootUV.X, RootUV.Y);
-				}
 			}
 
-			// width -> geoScope = kVertexScope  (one diameter per vertex, parallel to positions).
+			// width -> geoScope = kVertexScope (one diameter per vertex, parallel to positions).
 			OFloatGeomParam::Sample widthSample;
 			if (bWriteWidths)
 			{
 				widthSample = OFloatGeomParam::Sample(Alembic::Abc::FloatArraySample(AllWidths.data(), AllWidths.size()), kVertexScope);
 			}
 
-			// uv    -> geoScope = kUniformScope (2 floats per strand, one root UV per strand).
+			// uv    -> geoScope = kVertexScope (2 floats per vertex, the same root UV across a strand).
 			OV2fGeomParam::Sample uvSample;
 			if (bWriteUVs)
 			{
-				uvSample = OV2fGeomParam::Sample(V2fArraySample(RootUVs.data(), RootUVs.size()), kUniformScope);
+				uvSample = OV2fGeomParam::Sample(V2fArraySample(RootUVs.data(), RootUVs.size()), kVertexScope);
 			}
 
 			// Create Alembic curve sample
@@ -300,14 +353,25 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 			OCurvesSchema& CurvesSchema = CurvesObj.getSchema();
 			CurvesSchema.set(CurveSample);
 
-			// Per-group export report: geometry counts and which attributes were written.
-			UE_LOG(LogSimpleGroomExporter, Log, TEXT("Exported hair group %d '%s': %llu strands, %llu verts, width=%s, uv=%s"),
+			// Per-group export report. A scalp groom puts the widest diameter around 0.007 cm.
+			float MaxDiameter = 0.0f;
+			for (float Width : AllWidths)
+			{
+				MaxDiameter = FMath::Max(MaxDiameter, Width);
+			}
+
+			UE_LOG(LogSimpleGroomExporter, Log, TEXT("Exported hair group %d '%s': %llu strands, %llu verts, width=%s (max diameter %.5f cm, root/tip scale %.4f/%.4f, width override %s), uv=%s"),
 				GroupIdx,
 				*HairGroupInfo.Info.GroupName.ToString(),
 				static_cast<uint64>(VerticesPerStrand.size()),
 				static_cast<uint64>(AllPositions.size()),
 				bWriteWidths ? TEXT("YES") : TEXT("NO"),
+				MaxDiameter,
+				Geometry.HairRootScale,
+				Geometry.HairTipScale,
+				Geometry.HairWidth_Override ? TEXT("YES") : TEXT("NO"),
 				bWriteUVs ? TEXT("YES") : TEXT("NO"));
+
 			GroupIdx++;
 		}
 

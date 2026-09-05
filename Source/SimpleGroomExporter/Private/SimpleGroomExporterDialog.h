@@ -59,10 +59,10 @@ class SIMPLEGROOMEXPORTER_API USimpleGroomExportOptions : public UObject
 		EGroomExportAxis CustomOutZ = EGroomExportAxis::Y;
 
 		// --- Attributes (extra data that Unity reads) ---
-		UPROPERTY(EditAnywhere, config, Category = "Attributes", meta = (DisplayName = "Export Widths", ToolTip = "Write per-vertex strand diameter (from PointsRadius). Lets Unity auto-resolve strand diameter and tapering instead of using hand-tuned fallbacks."))
+		UPROPERTY(EditAnywhere, config, Category = "Attributes", meta = (DisplayName = "Export Widths", ToolTip = "Write the strand diameter, in centimeters, as the groom renders it."))
 		bool bExportWidths = true;
 
-		UPROPERTY(EditAnywhere, config, Category = "Attributes", meta = (DisplayName = "Export Root UV", ToolTip = "Write per-strand root UV (from CurvesRootUV). Needed for per-strand color/growth variation by root position."))
+		UPROPERTY(EditAnywhere, config, Category = "Attributes", meta = (DisplayName = "Export Root UV", ToolTip = "Write each strand's root UV on every one of its vertices."))
 		bool bExportRootUV = true;
 };
 
