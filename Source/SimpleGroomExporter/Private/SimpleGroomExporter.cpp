@@ -91,6 +91,40 @@ static float ResolveCoordU(const TArray<float>& PointsCoordU, uint32 PointIndex,
 	return NumVertsInStrand > 1 ? VertexIndexInStrand / static_cast<float>(NumVertsInStrand - 1) : 0.0f;
 }
 
+static void WriteCurvesObject(
+	OObject& Parent,
+	const std::string& Name,
+	const std::vector<Imath::V3f>& Positions,
+	const std::vector<int32_t>& VerticesPerStrand,
+	const std::vector<float>& Widths,
+	const std::vector<Imath::V2f>& RootUVs,
+	bool bWriteWidths,
+	bool bWriteUVs)
+{
+	OFloatGeomParam::Sample WidthSample;
+	if (bWriteWidths)
+	{
+		WidthSample = OFloatGeomParam::Sample(FloatArraySample(Widths.data(), Widths.size()), kVertexScope);
+	}
+
+	OV2fGeomParam::Sample UVSample;
+	if (bWriteUVs)
+	{
+		UVSample = OV2fGeomParam::Sample(V2fArraySample(RootUVs.data(), RootUVs.size()), kVertexScope);
+	}
+
+	OCurvesSchema::Sample CurveSample(
+		V3fArraySample(Positions.data(), Positions.size()),
+		Int32ArraySample(VerticesPerStrand.data(), VerticesPerStrand.size()),
+		kCubic,
+		kNonPeriodic,
+		WidthSample,
+		UVSample);
+
+	OCurves CurvesObject(Parent, Name);
+	CurvesObject.getSchema().set(CurveSample);
+}
+
 USimpleGroomExporter::USimpleGroomExporter()
 {
 	SupportedClass = UGroomAsset::StaticClass();
@@ -153,18 +187,27 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 		// Use the options selected by the user from the modal dialog
 		const USimpleGroomExportOptions* Options = ExportOptions.Options;
 		const bool bUseRenderdataForExport = Options->bUseRenderData;
+		const bool bMergeHairGroups = Options->bMergeHairGroups;
 
 		// Resolve the coordinate mapping (preset -> three axes) once for the whole export.
 		EGroomExportAxis MapOutX, MapOutY, MapOutZ;
 		ResolveAxisMapping(Options, MapOutX, MapOutY, MapOutZ);
-		UE_LOG(LogSimpleGroomExporter, Log, TEXT("Axis mapping: Alembic(X,Y,Z) = UE(%s, %s, %s). ExportWidths=%s, ExportRootUV=%s"),
+		UE_LOG(LogSimpleGroomExporter, Log, TEXT("Axis mapping: Alembic(X,Y,Z) = UE(%s, %s, %s). ExportWidths=%s, ExportRootUV=%s, MergeHairGroups=%s"),
 			AxisName(MapOutX), AxisName(MapOutY), AxisName(MapOutZ),
 			Options->bExportWidths ? TEXT("YES") : TEXT("NO"),
-			Options->bExportRootUV ? TEXT("YES") : TEXT("NO"));
+			Options->bExportRootUV ? TEXT("YES") : TEXT("NO"),
+			bMergeHairGroups ? TEXT("YES") : TEXT("NO"));
 
 		// TODO, consider using raw data hair desc data to export
 		// see how GenerateHairCardGenGroomData access it....
 		auto HairDesc = Groom->GetHairDescription();
+
+		std::vector<Imath::V3f> MergedPositions;
+		std::vector<int32_t> MergedVerticesPerStrand;
+		std::vector<float> MergedWidths;
+		std::vector<Imath::V2f> MergedRootUVs;
+		bool bMergedWidthsAvailable = Options->bExportWidths;
+		bool bMergedUVsAvailable = Options->bExportRootUV;
 
 		// Iterate over each hair group
 		int32 GroupIdx = 0;
@@ -320,38 +363,44 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 				VerticesPerStrand.emplace_back(NumVertsInStrand);
 			}
 
-			// width -> geoScope = kVertexScope (one diameter per vertex, parallel to positions).
-			OFloatGeomParam::Sample widthSample;
-			if (bWriteWidths)
+			if (bMergeHairGroups)
 			{
-				widthSample = OFloatGeomParam::Sample(Alembic::Abc::FloatArraySample(AllWidths.data(), AllWidths.size()), kVertexScope);
-			}
+				MergedPositions.insert(MergedPositions.end(), AllPositions.begin(), AllPositions.end());
+				MergedVerticesPerStrand.insert(MergedVerticesPerStrand.end(), VerticesPerStrand.begin(), VerticesPerStrand.end());
 
-			// uv    -> geoScope = kVertexScope (2 floats per vertex, the same root UV across a strand).
-			OV2fGeomParam::Sample uvSample;
-			if (bWriteUVs)
+				if (bMergedWidthsAvailable)
+				{
+					if (bWriteWidths)
+					{
+						MergedWidths.insert(MergedWidths.end(), AllWidths.begin(), AllWidths.end());
+					}
+					else
+					{
+						bMergedWidthsAvailable = false;
+						MergedWidths.clear();
+						UE_LOG(LogSimpleGroomExporter, Warning, TEXT("Merged output omits the 'width' attribute because group %d has no valid width data."), GroupIdx);
+					}
+				}
+
+				if (bMergedUVsAvailable)
+				{
+					if (bWriteUVs)
+					{
+						MergedRootUVs.insert(MergedRootUVs.end(), RootUVs.begin(), RootUVs.end());
+					}
+					else
+					{
+						bMergedUVsAvailable = false;
+						MergedRootUVs.clear();
+						UE_LOG(LogSimpleGroomExporter, Warning, TEXT("Merged output omits the 'uv' attribute because group %d has no valid root UV data."), GroupIdx);
+					}
+				}
+			}
+			else
 			{
-				uvSample = OV2fGeomParam::Sample(V2fArraySample(RootUVs.data(), RootUVs.size()), kVertexScope);
+				const std::string CurveName = TCHAR_TO_UTF8(*HairGroupInfo.Info.GroupName.ToString());
+				WriteCurvesObject(TopLevelObj, CurveName, AllPositions, VerticesPerStrand, AllWidths, RootUVs, bWriteWidths, bWriteUVs);
 			}
-
-			// Create Alembic curve sample
-			OCurvesSchema::Sample CurveSample
-			(
-				V3fArraySample(AllPositions.data(), AllPositions.size())
-				, Int32ArraySample(VerticesPerStrand.data(), VerticesPerStrand.size())
-				, kCubic // Type of curve; can be adjusted as needed
-				, kNonPeriodic
-				, widthSample
-				, uvSample
-			);
-
-			// Define the name for the Alembic curves object
-			std::string CurveName = std::string(TCHAR_TO_UTF8(*HairGroupInfo.Info.GroupName.ToString()));
-
-			// Create the Alembic curves object and set its schema
-			OCurves CurvesObj(TopLevelObj, CurveName);
-			OCurvesSchema& CurvesSchema = CurvesObj.getSchema();
-			CurvesSchema.set(CurveSample);
 
 			// Per-group export report. A scalp groom puts the widest diameter around 0.007 cm.
 			float MaxDiameter = 0.0f;
@@ -360,7 +409,8 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 				MaxDiameter = FMath::Max(MaxDiameter, Width);
 			}
 
-			UE_LOG(LogSimpleGroomExporter, Log, TEXT("Exported hair group %d '%s': %llu strands, %llu verts, width=%s (max diameter %.5f cm, root/tip scale %.4f/%.4f, width override %s), uv=%s"),
+			UE_LOG(LogSimpleGroomExporter, Log, TEXT("%s hair group %d '%s': %llu strands, %llu verts, width=%s (max diameter %.5f cm, root/tip scale %.4f/%.4f, width override %s), uv=%s"),
+				bMergeHairGroups ? TEXT("Prepared") : TEXT("Exported"),
 				GroupIdx,
 				*HairGroupInfo.Info.GroupName.ToString(),
 				static_cast<uint64>(VerticesPerStrand.size()),
@@ -373,6 +423,32 @@ bool USimpleGroomExporter::ExportBinary(UObject* Object, const TCHAR* Type, FArc
 				bWriteUVs ? TEXT("YES") : TEXT("NO"));
 
 			GroupIdx++;
+		}
+
+		if (bMergeHairGroups)
+		{
+			if (MergedVerticesPerStrand.empty())
+			{
+				UE_LOG(LogSimpleGroomExporter, Error, TEXT("Export failed: no valid strands were available for merged output."));
+				return false;
+			}
+
+			WriteCurvesObject(
+				TopLevelObj,
+				"MergedGroom",
+				MergedPositions,
+				MergedVerticesPerStrand,
+				MergedWidths,
+				MergedRootUVs,
+				bMergedWidthsAvailable,
+				bMergedUVsAvailable);
+
+			UE_LOG(LogSimpleGroomExporter, Log, TEXT("Exported merged groom: %llu groups, %llu strands, %llu verts, width=%s, uv=%s"),
+				static_cast<uint64>(HairGroups.HairGroups.Num()),
+				static_cast<uint64>(MergedVerticesPerStrand.size()),
+				static_cast<uint64>(MergedPositions.size()),
+				bMergedWidthsAvailable ? TEXT("YES") : TEXT("NO"),
+				bMergedUVsAvailable ? TEXT("YES") : TEXT("NO"));
 		}
 
 		UE_LOG(LogSimpleGroomExporter, Log, TEXT("Alembic export completed successfully: %s"), *OutputFileName);

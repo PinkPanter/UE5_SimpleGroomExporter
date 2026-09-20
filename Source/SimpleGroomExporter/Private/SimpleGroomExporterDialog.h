@@ -45,6 +45,9 @@ class SIMPLEGROOMEXPORTER_API USimpleGroomExportOptions : public UObject
 		UPROPERTY(EditAnywhere, config, Category = "Export Options", meta = (DisplayName = "Use Render Data", ToolTip = "Export the render/simulation strands the groom actually renders (guide->strand interpolation and grooming applied) instead of the raw imported strands. The groom must NOT be decimated. Can fix a few export issues but produces more strands."))
 		bool bUseRenderData = false;
 
+		UPROPERTY(EditAnywhere, config, Category = "Export Options", meta = (DisplayName = "Merge Hair Groups", ToolTip = "Write all hair groups to one Alembic curves object. This removes group boundaries from the exported file."))
+		bool bMergeHairGroups = false;
+
 		// --- Coordinate Mapping ---
 		UPROPERTY(EditAnywhere, config, Category = "Coordinate Mapping", meta = (DisplayName = "Axis Preset", ToolTip = "How UE axes are converted to Alembic. Custom lets you assign each output axis manually."))
 		EGroomExportAxisPreset AxisPreset = EGroomExportAxisPreset::Default;
