@@ -1,5 +1,8 @@
 # SimpleGroomExporter
 
+> **Fork note.** A fork of [Unity-Technologies/com.unity.demoteam.hair](https://github.com/Unity-Technologies/com.unity.demoteam.hair),
+> maintained for [MHBridge Importer](https://assetstore.unity.com/packages/tools/integration/mhbridge-importer-403996).
+
 Export Unreal Engine 5 groom assets to Alembic (`.abc`).
 
 This repository is a fork of [kostenickj/UE5_SimpleGroomExporter](https://github.com/kostenickj/UE5_SimpleGroomExporter) by Jacob Kostenick. The terms this code is available under are recorded in [LICENSE](LICENSE).
